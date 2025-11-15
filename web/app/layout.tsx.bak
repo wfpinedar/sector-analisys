@@ -1,0 +1,33 @@
+export const metadata = { title: "Sector Analysis", description: "Matriz de influencias" };
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="es">
+      <body className="min-h-screen antialiased">
+        <div className="max-w-6xl mx-auto px-4 md:px-6 lg:px-10 py-6">
+          <nav className="glass-panel mb-6 flex items-center justify-between gap-4 px-4 py-3">
+            <div className="flex items-center gap-3">
+              <div className="h-9 w-9 rounded-full" style={{ background: 'linear-gradient(135deg, var(--color-sky), var(--color-cerulean))' }} />
+              <div>
+                <div className="text-sm font-semibold tracking-wide text-white">Sector Analysis</div>
+                <div className="text-xs text-slate-300">MICMAC · Matriz de influencias</div>
+              </div>
+            </div>
+            <div className="hidden md:flex items-center gap-2 text-xs text-slate-300">
+              <a href="#" className="hover:text-white">Guia</a>
+              <span className="opacity-40">·</span>
+              <a href="#" className="hover:text-white">Soporte</a>
+            </div>
+          </nav>
+          {children}
+          <footer className="mt-10 text-center text-xs text-slate-400">
+            <span>Hecho con </span>
+            <span className="text-[#81c3d7]">datos</span>
+            <span> y </span>
+            <span className="text-[#3a7ca5]">criterio</span>
+          </footer>
+        </div>
+      </body>
+    </html>
+  );
+}
+
