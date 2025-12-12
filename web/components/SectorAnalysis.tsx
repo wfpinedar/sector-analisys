@@ -134,7 +134,7 @@ export default function SectorAnalysis({
               padding: "6px 10px",
             }}
           >
-            <div style={{ opacity: 0.7 }}>Promedio Y (Motricidad)</div>
+            <div style={{ opacity: 0.7 }}>Promedio Y (Movilidad)</div>
             <div style={{ fontWeight: 700 }}>{yAvg.toFixed(2)}</div>
           </div>
         </div>
@@ -149,15 +149,17 @@ export default function SectorAnalysis({
               dataKey="x"
               name="Dependencia"
               domain={[xMin, xMax]}
+              tickFormatter={(value) => Number(value).toFixed(2)}
               label={{ value: "Dependencia (X)", position: "insideBottom", dy: 10 }}
             />
             <YAxis
               type="number"
               dataKey="y"
-              name="Motricidad"
+              name="Movilidad"
               domain={[yMin, yMax]}
+              tickFormatter={(value) => Number(value).toFixed(2)}
               label={{
-                value: "Motricidad (Y)",
+                value: "Movilidad (Y)",
                 angle: -90,
                 position: "insideLeft",
                 dx: -10,
@@ -167,7 +169,7 @@ export default function SectorAnalysis({
               cursor={{ strokeDasharray: "3 3" }}
               formatter={(value: any, name: any, props) => {
                 const v = typeof value === "number" ? value.toFixed(2) : value;
-                return [v, name === "x" ? "Dependencia" : name === "y" ? "Motricidad" : name];
+                return [v, name === "x" ? "Dependencia" : name === "y" ? "Movilidad" : name];
               }}
               labelFormatter={(label: any, payload) =>
                 payload && payload[0] ? payload[0].payload.name : ""

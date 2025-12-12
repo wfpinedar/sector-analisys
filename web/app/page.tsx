@@ -1,6 +1,8 @@
 "use client";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactElement, ReactNode } from "react";
+import * as XLSX from "xlsx";
+import { toPng } from "html-to-image";
 import {
   ScatterChart,
   Scatter,
@@ -55,6 +57,7 @@ type GraphOut = {
 type ScatterPoint = { name: string; x: number; y: number; q?: string };
 
 type QuadrantPaletteEntry = { fill: string; bg: string; text: string; border: string };
+type ParsedDataset = { variables: string[]; matrix: number[][] };
 
 function computeXY(matrix: number[][]) {
   const n = matrix.length;
@@ -199,6 +202,176 @@ async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Pro
   return res.json();
 }
 
+function formatTick(value: number) {
+  if (!Number.isFinite(value)) return "";
+  const fixed = Number(value).toFixed(2);
+  return fixed;
+}
+
+function normalizeNumberCell(cell: any, rowIndex: number, colIndex: number) {
+  if (typeof cell === "number" && Number.isFinite(cell)) return cell;
+  if (typeof cell === "string") {
+    const normalized = cell.trim().replace(",", ".");
+    if (!normalized) return 0;
+    const num = Number(normalized);
+    if (Number.isFinite(num)) return num;
+  }
+  if (cell === null || cell === undefined || cell === "") return 0;
+  throw new Error(`Valor no numerico en la posicion (${rowIndex}, ${colIndex}).`);
+}
+
+function parseVariablesRows(rows: any[][]) {
+  if (!rows.length) return [];
+  const header = rows[0].map((cell) => String(cell ?? "").trim().toLowerCase());
+  let nameIdx = header.findIndex((h) => h === "name" || h === "variable" || h === "nombre");
+  const dataRows = nameIdx >= 0 ? rows.slice(1) : rows;
+  if (nameIdx < 0) nameIdx = 0;
+  const names = dataRows
+    .map((row) => String(row[nameIdx] ?? "").trim())
+    .filter((v) => v);
+  return names;
+}
+
+function parseMatrixTable(rows: any[][]): ParsedDataset {
+  if (!rows.length) throw new Error("El archivo no contiene datos.");
+  const headerCells = (rows[0] ?? []).slice(1).map((cell) => String(cell ?? "").trim());
+  if (!headerCells.length) throw new Error("La primera fila debe listar los nombres de variables.");
+  const variables = headerCells.map((name, idx) => {
+    if (!name) throw new Error(`Asigna un nombre a la variable ${idx + 1} en la cabecera.`);
+    return name;
+  });
+  const body = rows
+    .slice(1)
+    .filter((row) => row.some((cell) => cell !== null && cell !== undefined && String(cell).trim() !== ""));
+  if (body.length !== variables.length) {
+    throw new Error(`La matriz debe ser ${variables.length}x${variables.length}; se encontraron ${body.length} filas con datos.`);
+  }
+  const matrix = body.map((row, rowIndex) => {
+    const rowName = String(row[0] ?? "").trim();
+    if (rowName && rowName !== variables[rowIndex]) {
+      throw new Error(
+        `El nombre de fila "${rowName}" no coincide con "${variables[rowIndex]}" en la fila ${rowIndex + 2}.`
+      );
+    }
+    const values = variables.map((_, colIndex) =>
+      normalizeNumberCell(row[colIndex + 1], rowIndex + 2, colIndex + 2)
+    );
+    return values;
+  });
+  return { variables, matrix };
+}
+
+async function parseExcelFile(file: File): Promise<ParsedDataset> {
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, { type: "array" });
+  if (!workbook.SheetNames.length) {
+    throw new Error("El Excel no tiene hojas para leer.");
+  }
+  const sheetNames = workbook.SheetNames;
+  const matrixSheetName =
+    sheetNames.find((name) => name.toLowerCase().includes("mat")) ??
+    sheetNames.find((name) => name.toLowerCase().includes("matriz")) ??
+    sheetNames[0];
+  const matrixRows = XLSX.utils.sheet_to_json<any[]>(workbook.Sheets[matrixSheetName], {
+    header: 1,
+    blankrows: false,
+  });
+  const parsed = parseMatrixTable(matrixRows);
+
+  const varsSheetName = sheetNames.find((name) => name.toLowerCase().includes("var"));
+  if (varsSheetName) {
+    const varsRows = XLSX.utils.sheet_to_json<any[]>(workbook.Sheets[varsSheetName], {
+      header: 1,
+      blankrows: false,
+    });
+    const vars = parseVariablesRows(varsRows);
+    if (vars.length === parsed.variables.length) {
+      parsed.variables = vars;
+    }
+  }
+  return parsed;
+}
+
+function parseCsvVariables(text: string) {
+  const wb = XLSX.read(text, { type: "string" });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1, blankrows: false });
+  const names = parseVariablesRows(rows);
+  if (!names.length) throw new Error("variables.csv no tiene nombres validos.");
+  return names;
+}
+
+function parseCsvMatrix(text: string): ParsedDataset {
+  const wb = XLSX.read(text, { type: "string" });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1, blankrows: false });
+  return parseMatrixTable(rows);
+}
+
+function datasetToCsvFiles(data: ParsedDataset) {
+  const varsContent = ["name", ...data.variables].join("\n");
+  const header = ["", ...data.variables].join(",");
+  const body = data.variables.map((name, idx) =>
+    [name, ...(data.matrix[idx] ?? []).map((v) => Number(v ?? 0))].join(",")
+  );
+  const matrixContent = [header, ...body].join("\n");
+  const varsFile = new File([varsContent], "variables.csv", { type: "text/csv" });
+  const matrixFile = new File([matrixContent], "matrix.csv", { type: "text/csv" });
+  return { varsFile, matrixFile };
+}
+
+function ChartModal({
+  open,
+  title,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const [downloading, setDownloading] = useState(false);
+
+  const download = async () => {
+    if (!contentRef.current) return;
+    setDownloading(true);
+    try {
+      const dataUrl = await toPng(contentRef.current, { cacheBust: true, pixelRatio: 2 });
+      const link = document.createElement("a");
+      link.href = dataUrl;
+      const safe = title.toLowerCase().replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "") || "grafico";
+      link.download = `${safe}.png`;
+      link.click();
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-5xl rounded-2xl border border-white/10 bg-slate-950/90 p-5 shadow-2xl">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 className="text-lg font-semibold text-white">{title}</h3>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="secondary" onClick={download} loading={downloading}>
+              Guardar como imagen
+            </Button>
+            <Button variant="secondary" onClick={onClose}>
+              Cerrar
+            </Button>
+          </div>
+        </div>
+        <div ref={contentRef} className="mt-4 rounded-xl border border-white/10 bg-slate-900/70 p-3">
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Spinner moved to atoms/Spinner
 
 export default function Page() {
@@ -218,6 +391,9 @@ export default function Page() {
   const [result, setResult] = useState<ComputeOut | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importMessage, setImportMessage] = useState<string | null>(null);
 
   const [heatmap, setHeatmap] = useState<HeatmapOut | null>(null);
   const [heatmapError, setHeatmapError] = useState<string | null>(null);
@@ -233,6 +409,10 @@ export default function Page() {
   const [scaleValues, setScaleValues] = useState<{ value: number; description?: string }[]>([]);
   const [scaleBusy, setScaleBusy] = useState(false);
   const [scaleError, setScaleError] = useState<string | null>(null);
+  const [hoveredVar, setHoveredVar] = useState<string | null>(null);
+  const [hiddenVars, setHiddenVars] = useState<string[]>([]);
+  const [chartModal, setChartModal] = useState<{ title: string; content: ReactNode } | null>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const previewResult = useMemo(() => {
     if (result) return null;
@@ -302,6 +482,13 @@ export default function Page() {
       return next;
     });
   }, [variables.length]);
+
+  useEffect(() => {
+    setHiddenVars((prev) => prev.filter((name) => variables.includes(name)));
+    if (hoveredVar && !variables.includes(hoveredVar)) {
+      setHoveredVar(null);
+    }
+  }, [hoveredVar, variables]);
 
   const activeScale = useMemo(() => {
     if (!scales.length) return null;
@@ -459,6 +646,11 @@ export default function Page() {
     }));
   }, [analysis]);
 
+  const visibleDataPoints = useMemo(
+    () => dataPoints.filter((point) => !hiddenVars.includes(point.name)),
+    [dataPoints, hiddenVars]
+  );
+
   const summary = useMemo(() => {
     if (!analysis) return null;
     const total = analysis.variables.length || 1;
@@ -471,6 +663,20 @@ export default function Page() {
     }
     return { total: analysis.variables.length, avgX, avgY, counts };
   }, [analysis]);
+
+  const barData = useMemo(() => {
+    if (!analysis) return [];
+    return analysis.variables.map((name, index) => ({
+      name,
+      Dependencia: analysis.dependencia_x[index],
+      Movilidad: analysis.motricidad_y[index],
+    }));
+  }, [analysis]);
+
+  const visibleBarData = useMemo(
+    () => barData.filter((item) => !hiddenVars.includes(item.name)),
+    [barData, hiddenVars]
+  );
 
   async function createProject() {
     setBusy(true);
@@ -581,6 +787,87 @@ export default function Page() {
     await loadGraph(minW, directed);
   }
 
+  async function refreshMatrixFromApi() {
+    if (!projectId) return;
+    const snap = await requestJson<any>(`${API}/projects/${projectId}/matrix`);
+    const vars: string[] = Array.isArray(snap?.variables) ? snap.variables.map((v: any) => String(v)) : [];
+    const mx: number[][] = Array.isArray(snap?.matrix) ? snap.matrix : [];
+    if (vars.length) setVariables(vars);
+    if (mx.length) setMatrix(mx);
+  }
+
+  async function persistImportedDataset(dataset: ParsedDataset) {
+    if (!projectId) {
+      throw new Error("Crea un proyecto antes de importar archivos.");
+    }
+    const { varsFile, matrixFile } = datasetToCsvFiles(dataset);
+    const formData = new FormData();
+    formData.append("variables_file", varsFile);
+    formData.append("matrix_file", matrixFile);
+    formData.append("replace", "true");
+    await requestJson(`${API}/projects/${projectId}/import/csv`, {
+      method: "POST",
+      body: formData,
+    });
+    await refreshMatrixFromApi();
+    setResult(null);
+    await compute();
+    setStep(4);
+  }
+
+  async function handleImportFiles(filesList: FileList | null) {
+    if (!filesList || filesList.length === 0) return;
+    setImportError(null);
+    setImportMessage(null);
+    if (!projectId) {
+      setImportError("Crea o selecciona un proyecto antes de importar.");
+      return;
+    }
+    const files = Array.from(filesList);
+    setImporting(true);
+    try {
+      const [single] = files;
+      const lowerNames = files.map((f) => f.name.toLowerCase());
+      const isExcel = files.length === 1 && lowerNames[0].endsWith(".xlsx");
+      const csvFiles = files.filter((f) => f.name.toLowerCase().endsWith(".csv"));
+      if (isExcel && single) {
+        const dataset = await parseExcelFile(single);
+        await persistImportedDataset(dataset);
+        setImportMessage("Archivo Excel importado y matriz reemplazada.");
+        return;
+      }
+      if (csvFiles.length >= 2) {
+        const varsFile =
+          csvFiles.find((f) => f.name.toLowerCase().includes("var")) ?? csvFiles[0];
+        const matrixFile =
+          csvFiles.find((f) => f !== varsFile && f.name.toLowerCase().includes("mat")) ??
+          csvFiles.find((f) => f !== varsFile) ??
+          csvFiles[1];
+        if (!varsFile || !matrixFile) throw new Error("Sube variables.csv y matrix.csv.");
+        const varsText = await varsFile.text();
+        const matrixText = await matrixFile.text();
+        const names = parseCsvVariables(varsText);
+        const parsed = parseCsvMatrix(matrixText);
+        if (names.length !== parsed.variables.length) {
+          throw new Error("Los archivos CSV no tienen la misma cantidad de variables.");
+        }
+        const mismatch = parsed.variables.some((name, idx) => name !== names[idx]);
+        if (mismatch) {
+          throw new Error("Los encabezados de matrix.csv deben coincidir con variables.csv en orden y nombre.");
+        }
+        await persistImportedDataset({ variables: names, matrix: parsed.matrix });
+        setImportMessage("CSV importados y matriz reemplazada.");
+        return;
+      }
+      throw new Error("Sube un Excel (.xlsx) o ambos CSV: variables.csv y matrix.csv.");
+    } catch (err) {
+      setImportError((err as Error).message);
+    } finally {
+      setImporting(false);
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  }
+
   function setVarName(idx: number, name: string) {
     setVariables((prev) => prev.map((value, index) => (index === idx ? name : value)));
   }
@@ -608,6 +895,12 @@ export default function Page() {
     );
   }
 
+  function toggleVariableVisibility(name: string) {
+    setHiddenVars((prev) =>
+      prev.includes(name) ? prev.filter((item) => item !== name) : [...prev, name]
+    );
+  }
+
   function handleMinWeightChange(raw: string) {
     const next = Number(raw);
     if (!Number.isFinite(next) || next < 0) {
@@ -625,14 +918,15 @@ export default function Page() {
     "input-surface w-24 text-right font-medium transition disabled:cursor-not-allowed disabled:opacity-60";
 
   const scatterDomain = useMemo<Record<"x" | "y", [AxisDomainItem, AxisDomainItem]>>(() => {
-    if (!dataPoints.length) {
+    const source = visibleDataPoints.length ? visibleDataPoints : dataPoints;
+    if (!source.length) {
       return {
         x: ["auto", "auto"] as [AxisDomainItem, AxisDomainItem],
         y: ["auto", "auto"] as [AxisDomainItem, AxisDomainItem],
       };
     }
-    const xs = dataPoints.map((point) => point.x);
-    const ys = dataPoints.map((point) => point.y);
+    const xs = source.map((point) => point.x);
+    const ys = source.map((point) => point.y);
     const minX = Math.min(...xs);
     const maxX = Math.max(...xs);
     const minY = Math.min(...ys);
@@ -649,7 +943,7 @@ export default function Page() {
       x: pad(minX, maxX),
       y: pad(minY, maxY),
     };
-  }, [dataPoints]);
+  }, [dataPoints, visibleDataPoints]);
 
   const renderScatterPoint = useCallback((props: any): ReactElement => {
     const { cx, cy, payload } = props;
@@ -657,13 +951,226 @@ export default function Page() {
       return <g />;
     }
     const color = getQuadrantColor(payload?.q);
+    const isHovered = hoveredVar === payload?.name;
     return (
       <g>
-        <circle cx={cx} cy={cy} r={10} fill={`${color}33`} stroke={color} strokeWidth={2} />
-        <circle cx={cx} cy={cy} r={4} fill="#0f172a" stroke="#0f172a" strokeWidth={1} />
+        <circle
+          cx={cx}
+          cy={cy}
+          r={isHovered ? 12 : 10}
+          fill={`${color}33`}
+          stroke={color}
+          strokeWidth={2}
+        />
+        <circle cx={cx} cy={cy} r={isHovered ? 5 : 4} fill="#0f172a" stroke="#0f172a" strokeWidth={1} />
+        {isHovered && payload?.name && (
+          <text
+            x={cx}
+            y={cy - 14}
+            textAnchor="middle"
+            fontSize={12}
+            fill="#e0f2fe"
+            stroke="#0f172a"
+            strokeWidth={0.25}
+          >
+            {payload.name}
+          </text>
+        )}
       </g>
     );
+  }, [hoveredVar]);
+
+  const openChartPreview = useCallback((title: string, content: ReactNode) => {
+    setChartModal({ title, content });
   }, []);
+
+  const renderScatterChart = useCallback(
+    (height = 420) => (
+      <div
+        className="relative rounded-2xl border border-[rgb(63,124,165,0.35)] bg-[rgba(15,33,45,0.8)]"
+        style={{ height }}
+      >
+        {!analysis || !dataPoints.length ? (
+          <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-slate-400">
+            Calcula la matriz para visualizar el plano de dependencia vs movilidad.
+          </div>
+        ) : !visibleDataPoints.length ? (
+          <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-slate-400">
+            Activa al menos una variable para verla en el grafico.
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height="100%">
+            <ScatterChart margin={{ top: 20, right: 24, bottom: 48, left: 48 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#254861" />
+              <XAxis
+                type="number"
+                dataKey="x"
+                domain={scatterDomain.x}
+                tick={{ fill: "#94a3b8" }}
+                stroke="#475569"
+                tickFormatter={(value) => formatTick(Number(value))}
+              >
+                <Label value="Dependencia (X)" position="bottom" fill="#cbd5f5" offset={0} />
+              </XAxis>
+              <YAxis
+                type="number"
+                dataKey="y"
+                domain={scatterDomain.y}
+                tick={{ fill: "#94a3b8" }}
+                stroke="#475569"
+                tickFormatter={(value) => formatTick(Number(value))}
+              >
+                <Label value="Movilidad (Y)" angle={-90} position="left" fill="#cbd5f5" offset={10} />
+              </YAxis>
+              {Number.isFinite(analysis?.x_cut) && (
+                <ReferenceLine x={analysis?.x_cut} stroke="#d9dcd6" strokeDasharray="4 4" />
+              )}
+              {Number.isFinite(analysis?.y_cut) && (
+                <ReferenceLine y={analysis?.y_cut} stroke="rgb(129,195,215)" strokeDasharray="4 4" />
+              )}
+              <Tooltip
+                cursor={{ strokeDasharray: "4 4", stroke: "#475569" }}
+                formatter={(value: number, _name, props) => {
+                  const key = (props as Payload<number, string> | undefined)?.dataKey;
+                  const label = key === "x" ? "Dependencia" : "Movilidad";
+                  return [formatTick(value), label];
+                }}
+                labelFormatter={(_label: any, payload: Payload<number, "Dependencia" | "Movilidad">[]) => {
+                  const entry = payload?.[0]?.payload as ScatterPoint | undefined;
+                  return entry?.name ?? "";
+                }}
+              />
+              <Scatter
+                data={visibleDataPoints}
+                name="Variables"
+                isAnimationActive={false}
+                legendType="circle"
+                shape={renderScatterPoint}
+                onMouseEnter={(_e: any, index: number) =>
+                  setHoveredVar(visibleDataPoints[index]?.name ?? null)
+                }
+                onMouseLeave={() => setHoveredVar(null)}
+              />
+            </ScatterChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+    ),
+    [analysis, dataPoints.length, renderScatterPoint, scatterDomain, visibleDataPoints]
+  );
+
+  const renderBarChart = useCallback(
+    (height = 420) => (
+      <div
+        className="rounded-2xl border border-[rgb(63,124,165,0.35)] bg-[rgba(15,33,45,0.8)]"
+        style={{ height }}
+      >
+        {!analysis || !barData.length ? (
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-slate-400">
+            Calcula la matriz para visualizar la distribucion por variable.
+          </div>
+        ) : !visibleBarData.length ? (
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-slate-400">
+            Activa variables para mostrarlas en la grafica de barras.
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={visibleBarData} margin={{ top: 20, right: 24, bottom: 48, left: 40 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#254861" />
+              <XAxis
+                dataKey="name"
+                angle={-25}
+                textAnchor="end"
+                height={80}
+                tick={{ fill: "#94a3b8" }}
+                stroke="#475569"
+              />
+              <YAxis tick={{ fill: "#94a3b8" }} stroke="#475569" tickFormatter={(value) => formatTick(Number(value))} />
+              <Tooltip formatter={(value: number) => formatTick(value)} />
+              <Legend />
+              <ReferenceLine y={analysis.x_cut} stroke="#d9dcd6" strokeDasharray="4 4" />
+              <ReferenceLine y={analysis.y_cut} stroke="rgb(129,195,215)" strokeDasharray="4 4" />
+              <Bar
+                dataKey="Dependencia"
+                name="Dependencia (X)"
+                fill="#3a7ca5"
+                radius={[6, 6, 0, 0]}
+                maxBarSize={36}
+              />
+              <Bar
+                dataKey="Movilidad"
+                name="Movilidad (Y)"
+                fill="#81c3d7"
+                radius={[6, 6, 0, 0]}
+                maxBarSize={36}
+              />
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+    ),
+    [analysis, barData.length, visibleBarData]
+  );
+
+  const renderHeatmapContent = useCallback(
+    (maxHeight?: string | number) => {
+      if (!heatmap) return null;
+      return (
+        <div
+          className="overflow-auto rounded-2xl border border-[rgb(63,124,165,0.35)]"
+          style={maxHeight ? { maxHeight } : undefined}
+        >
+          <table className="min-w-full border-separate border-spacing-0 text-sm text-slate-100">
+            <thead className="sticky top-0 z-10 bg-[#102637]/90 backdrop-blur">
+              <tr>
+                <th className="sticky left-0 z-20 border-b border-[rgb(129,195,215,0.25)] bg-[#102637]/95 px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
+                  Var
+                </th>
+                {heatmap.variables.map((name, index) => (
+                  <th
+                    key={index}
+                    className="border-b border-[rgb(129,195,215,0.25)] px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-300"
+                  >
+                    {name}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {heatmap.variables.map((row, i) => (
+                <tr
+                  key={row}
+                  className={i % 2 === 0 ? "bg-[rgba(47,102,144,0.14)]" : "bg-[rgba(22,66,91,0.4)]"}
+                >
+                  <th className="sticky left-0 z-10 border-b border-[rgb(129,195,215,0.25)] bg-[#102637]/85 px-4 py-3 text-left text-sm font-medium text-white">
+                    {row}
+                  </th>
+                  {heatmap.variables.map((_, j) => {
+                    const value = heatmap.matrix[i][j];
+                    const min = heatmap.scale.min;
+                    const max = heatmap.scale.max;
+                    const t = (value - min) / ((max - min) || 1);
+                    const background =
+                      i === j ? "rgba(15,23,42,0.4)" : `hsl(${Math.round(210 - 210 * t)} 80% ${20 + 30 * t}%)`;
+                    return (
+                      <td
+                        key={j}
+                        className="border-b border-[rgb(129,195,215,0.25)] px-3 py-2 text-center text-sm font-medium text-slate-100"
+                        style={{ background }}
+                      >
+                        {formatTick(Number(value))}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    },
+    [heatmap]
+  );
 
   return (
     <main className="relative min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 pb-20 text-slate-100">
@@ -674,7 +1181,7 @@ export default function Page() {
             Matriz cruzada sectorial
           </span>
           <h1 className="text-3xl font-semibold leading-tight text-white md:text-4xl lg:text-[2.65rem]">
-            Analiza la dependencia y motricidad de tu sector paso a paso
+            Analiza la dependencia y movilidad de tu sector paso a paso
           </h1>
           <p className="text-sm leading-relaxed text-slate-300 md:max-w-3xl">
             Configura una escala, modela las variables clave y descubre insights visuales sobre el comportamiento del sistema:
@@ -906,6 +1413,43 @@ export default function Page() {
               </div>
             </div>
 
+            <div className="surface-muted flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="space-y-1">
+                <div className="text-sm font-semibold text-white">Importar Excel o CSV</div>
+                <p className="text-xs leading-relaxed text-slate-300">
+                  Sube un Excel (.xlsx) con la matriz o los archivos variables.csv y matrix.csv exportados desde el backend. El contenido reemplaza las variables y celdas actuales del proyecto.
+                </p>
+                {importError && (
+                  <div className="rounded border border-red-400/40 bg-red-500/10 px-3 py-2 text-xs text-red-100">
+                    {importError}
+                  </div>
+                )}
+                {importMessage && !importError && (
+                  <div className="rounded border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100">
+                    {importMessage}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  accept=".csv,.xlsx"
+                  multiple
+                  className="hidden"
+                  onChange={(event) => handleImportFiles(event.target.files)}
+                />
+                <Button
+                  variant="secondary"
+                  onClick={() => importInputRef.current?.click()}
+                  loading={importing}
+                  disabled={!projectId}
+                >
+                  {importing ? "Importando..." : "Cargar archivos"}
+                </Button>
+              </div>
+            </div>
+
             <div className="surface-muted p-4 sm:p-6">
               <div className="max-h-[520px] overflow-auto scrollbar-thin scrollbar-thumb-[rgb(129,195,215,0.35)] scrollbar-track-transparent">
                 <table className="min-w-full border-separate border-spacing-0 text-sm text-slate-200">
@@ -991,7 +1535,7 @@ export default function Page() {
                 <Badge tone="warning">Vista preliminar calculada en el navegador</Badge>
                   )}
                   <p className="text-sm leading-relaxed text-slate-300">
-                    Interpreta la posicion de cada variable dentro del plano dependencia versus motricidad y revisa la red de influencias resultante para priorizar acciones de gestion.
+                    Interpreta la posicion de cada variable dentro del plano dependencia versus movilidad y revisa la red de influencias resultante para priorizar acciones de gestion.
                   </p>
                 </div>
               </div>
@@ -1007,7 +1551,7 @@ export default function Page() {
 
             {isPreview && (
               <div className="rounded-2xl border border-amber-300/30 bg-amber-400/10 p-5 text-sm leading-relaxed text-amber-100">
-                Para obtener el heatmap y la red de influencias finales, guarda la matriz y ejecuta el calculo con el backend. Esta vista preliminar te ayuda a validar rapidamente la distribucion de dependencia y motricidad.
+                Para obtener el heatmap y la red de influencias finales, guarda la matriz y ejecuta el calculo con el backend. Esta vista preliminar te ayuda a validar rapidamente la distribucion de dependencia y movilidad.
               </div>
             )}
 
@@ -1024,15 +1568,15 @@ export default function Page() {
                     Media dependencia (X)
                   </span>
                   <div className="mt-2 text-3xl font-semibold text-white">
-                    {summary.avgX.toFixed(2)}
+                    {formatTick(summary.avgX)}
                   </div>
                 </div>
                 <div className="surface-muted p-4 text-center">
                   <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
-                    Media motricidad (Y)
+                    Media movilidad (Y)
                   </span>
                   <div className="mt-2 text-3xl font-semibold text-white">
-                    {summary.avgY.toFixed(2)}
+                    {formatTick(summary.avgY)}
                   </div>
                 </div>
               </div>
@@ -1040,102 +1584,100 @@ export default function Page() {
 
             <div className="grid gap-6 xl:grid-cols-[2fr_1fr]">
               <div className="space-y-4 surface-muted p-5">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-3">
                   <h3 className="text-lg font-semibold text-white">
-                    Plano dependencia vs motricidad
+                    Plano dependencia vs movilidad
                   </h3>
+                  <div className="flex flex-wrap items-center gap-2 text-xs sm:text-sm">
+                    {hiddenVars.length > 0 && (
+                      <span className="rounded-full bg-white/5 px-3 py-1 text-slate-200">
+                        {hiddenVars.length} ocultas
+                      </span>
+                    )}
+                    <Button
+                      variant="secondary"
+                      onClick={() =>
+                        openChartPreview("Plano dependencia vs movilidad", renderScatterChart(560))
+                      }
+                      className="border-[rgb(var(--accent-rgb)_/_0.35)] px-3"
+                    >
+                      Ver en popup
+                    </Button>
+                  </div>
                 </div>
-                <div className="relative h-[420px] rounded-2xl border border-[rgb(63,124,165,0.35)] bg-[rgba(15,33,45,0.8)]">
-                  {!dataPoints.length ? (
-                    <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-slate-400">
-                      Calcula la matriz para visualizar el plano de dependencia vs motricidad.
-                    </div>
-                  ) : (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <ScatterChart margin={{ top: 20, right: 24, bottom: 48, left: 48 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#254861" />
-                        <XAxis
-                          type="number"
-                          dataKey="x"
-                          domain={scatterDomain.x}
-                          tick={{ fill: "#94a3b8" }}
-                          stroke="#475569"
-                        >
-                          <Label value="Dependencia (X)" position="bottom" fill="#cbd5f5" offset={0} />
-                        </XAxis>
-                        <YAxis
-                          type="number"
-                          dataKey="y"
-                          domain={scatterDomain.y}
-                          tick={{ fill: "#94a3b8" }}
-                          stroke="#475569"
-                        >
-                          <Label value="Motricidad (Y)" angle={-90} position="left" fill="#cbd5f5" offset={10} />
-                        </YAxis>
-                        {Number.isFinite(analysis.x_cut) && (
-                          <ReferenceLine x={analysis.x_cut} stroke="#d9dcd6" strokeDasharray="4 4" />
-                        )}
-                        {Number.isFinite(analysis.y_cut) && (
-                          <ReferenceLine y={analysis.y_cut} stroke="rgb(129,195,215)" strokeDasharray="4 4" />
-                        )}
-                        <Tooltip
-                          cursor={{ strokeDasharray: "4 4", stroke: "#475569" }}
-                          formatter={(value: number, _name, props) => {
-                            const key = (props as Payload<number, string> | undefined)?.dataKey;
-                            const label = key === "x" ? "Dependencia" : "Motricidad";
-                            return [value.toFixed(2), label];
-                          }}
-                          labelFormatter={(_label: any, payload: Payload<number, "Dependencia" | "Motricidad">[]) => {
-                            const entry = payload?.[0]?.payload as ScatterPoint | undefined;
-                            return entry?.name ?? "";
-                          }}
-                        />
-                        <Scatter
-                          data={dataPoints}
-                          name="Variables"
-                          isAnimationActive={false}
-                          legendType="circle"
-                          shape={renderScatterPoint}
-                        />
-                      </ScatterChart>
-                    </ResponsiveContainer>
-                  )}
-                </div>
+                {renderScatterChart(420)}
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="surface-muted p-4">
                     <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
                       Corte dependencias (X)
                     </div>
                     <div className="text-xl font-semibold text-white">
-                      {analysis.x_cut.toFixed(2)}
+                      {formatTick(analysis.x_cut)}
                     </div>
                   </div>
                   <div className="surface-muted p-4">
                     <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
-                      Corte motricidad (Y)
+                      Corte movilidad (Y)
                     </div>
                     <div className="text-xl font-semibold text-white">
-                      {analysis.y_cut.toFixed(2)}
+                      {formatTick(analysis.y_cut)}
                     </div>
                   </div>
                 </div>
               </div>
 
               <div className="space-y-4 surface-muted p-5">
-                <h3 className="text-lg font-semibold text-white">Cuadrantes</h3>
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-lg font-semibold text-white">Cuadrantes</h3>
+                  {hiddenVars.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setHiddenVars([])}
+                      className="text-xs text-[rgb(var(--accent-rgb))] underline-offset-2 hover:underline"
+                    >
+                      Mostrar todas
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-slate-300">
+                  Pasa el cursor sobre los puntos para resaltar y usa el check para ocultar variables del plano.
+                </p>
                 <ul className="divide-y divide-white/10 text-sm">
-                  {analysis.variables.map((name, idx) => (
-                    <li key={name} className={clsx("flex items-center justify-between gap-3 py-2", idx === 0 && "pt-0", idx === analysis.variables.length - 1 && "pb-0")}>
-                      <span className="truncate text-slate-100">{name}</span>
-                      <span className={quadrantBadgeClasses(analysis.quadrants[name])}>
-                        <span
-                          className="h-2 w-2 rounded-full"
-                          style={{ backgroundColor: getQuadrantColor(analysis.quadrants[name]) }}
-                        />
-                        {getQuadrantDisplayName(analysis.quadrants[name])}
-                      </span>
-                    </li>
-                  ))}
+                  {analysis.variables.map((name, idx) => {
+                    const hidden = hiddenVars.includes(name);
+                    const highlighted = hoveredVar === name;
+                    return (
+                      <li
+                        key={name}
+                        className={clsx(
+                          "flex items-center justify-between gap-3 py-2 transition",
+                          idx === 0 && "pt-0",
+                          idx === analysis.variables.length - 1 && "pb-0",
+                          highlighted && "bg-[rgba(129,195,215,0.08)]",
+                          hidden && "opacity-60"
+                        )}
+                        onMouseEnter={() => setHoveredVar(name)}
+                        onMouseLeave={() => setHoveredVar(null)}
+                      >
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            checked={!hidden}
+                            onChange={() => toggleVariableVisibility(name)}
+                            className="h-4 w-4 rounded border border-[rgb(129,195,215,0.45)] bg-[rgba(15,33,45,0.9)] text-[rgb(129,195,215)] focus:ring-[rgb(129,195,215)]/60"
+                          />
+                          <span className="truncate text-slate-100">{name}</span>
+                        </div>
+                        <span className={quadrantBadgeClasses(analysis.quadrants[name])}>
+                          <span
+                            className="h-2 w-2 rounded-full"
+                            style={{ backgroundColor: getQuadrantColor(analysis.quadrants[name]) }}
+                          />
+                          {getQuadrantDisplayName(analysis.quadrants[name])}
+                        </span>
+                      </li>
+                    );
+                  })}
                 </ul>
                 {summary && (
                   <div className="surface-muted p-3 text-xs text-slate-300">
@@ -1151,110 +1693,49 @@ export default function Page() {
             </div>
 
             <div className="surface-muted p-5">
-              <h3 className="text-lg font-semibold text-white">Distribucion por variable</h3>
-              <div className="mt-4 h-[420px] rounded-2xl border border-[rgb(63,124,165,0.35)] bg-[rgba(15,33,45,0.8)]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart
-                    data={analysis.variables.map((name, index) => ({
-                      name,
-                      Dependencia: analysis.dependencia_x[index],
-                      Motricidad: analysis.motricidad_y[index],
-                    }))}
-                    margin={{ top: 20, right: 24, bottom: 48, left: 40 }}
-                  >
-                    <CartesianGrid strokeDasharray="3 3" stroke="#254861" />
-                    <XAxis
-                      dataKey="name"
-                      angle={-25}
-                      textAnchor="end"
-                      height={80}
-                      tick={{ fill: "#94a3b8" }}
-                      stroke="#475569"
-                    />
-                    <YAxis tick={{ fill: "#94a3b8" }} stroke="#475569" />
-                    <Tooltip formatter={(value: number) => value.toFixed(2)} />
-                    <Legend />
-                    <ReferenceLine y={analysis.x_cut} stroke="#d9dcd6" strokeDasharray="4 4" />
-                    <ReferenceLine y={analysis.y_cut} stroke="rgb(129,195,215)" strokeDasharray="4 4" />
-                    <Bar
-                      dataKey="Dependencia"
-                      name="Dependencia (X)"
-                      fill="#3a7ca5"
-                      radius={[6, 6, 0, 0]}
-                      maxBarSize={36}
-                    />
-                    <Bar
-                      dataKey="Motricidad"
-                      name="Motricidad (Y)"
-                      fill="#81c3d7"
-                      radius={[6, 6, 0, 0]}
-                      maxBarSize={36}
-                    />
-                  </BarChart>
-                </ResponsiveContainer>
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-lg font-semibold text-white">Distribucion por variable</h3>
+                <Button
+                  variant="secondary"
+                  onClick={() => openChartPreview("Distribucion por variable", renderBarChart(560))}
+                  className="border-[rgb(var(--accent-rgb)_/_0.35)] px-3"
+                >
+                  Ver en popup
+                </Button>
+              </div>
+              <div className="mt-4">
+                {renderBarChart(420)}
               </div>
             </div>
 
             <div className="grid gap-6 lg:grid-cols-2">
               <div className="space-y-4 surface-muted p-5">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-lg font-semibold text-white">Heatmap</h3>
-                  {heatmapLoading && (
-                    <span className="text-xs text-slate-300">Actualizando...</span>
-                  )}
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <h3 className="text-lg font-semibold text-white">Heatmap</h3>
+                    {heatmapLoading && (
+                      <span className="text-xs text-slate-300">Actualizando...</span>
+                    )}
+                  </div>
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      if (!heatmap) return;
+                      const content = renderHeatmapContent("70vh");
+                      if (content) openChartPreview("Heatmap", content);
+                    }}
+                    disabled={!heatmap || !!heatmapError}
+                    className="border-[rgb(var(--accent-rgb)_/_0.35)] px-3"
+                  >
+                    Ver en popup
+                  </Button>
                 </div>
                 {heatmapError && (
                   <div className="rounded-xl border border-red-400/40 bg-red-500/10 p-3 text-sm text-red-200">
                     {heatmapError}
                   </div>
                 )}
-                {heatmap && !heatmapError && (
-                  <div className="overflow-auto rounded-2xl border border-[rgb(63,124,165,0.35)]">
-                    <table className="min-w-full border-separate border-spacing-0 text-sm text-slate-100">
-                      <thead className="sticky top-0 z-10 bg-[#102637]/90 backdrop-blur">
-                        <tr>
-                          <th className="sticky left-0 z-20 border-b border-[rgb(129,195,215,0.25)] bg-[#102637]/95 px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
-                            Var
-                          </th>
-                          {heatmap.variables.map((name, index) => (
-                            <th
-                              key={index}
-                              className="border-b border-[rgb(129,195,215,0.25)] px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-300"
-                            >
-                              {name}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {heatmap.variables.map((row, i) => (
-                          <tr key={row} className={i % 2 === 0 ? "bg-[rgba(47,102,144,0.14)]" : "bg-[rgba(22,66,91,0.4)]"}>
-                            <th className="sticky left-0 z-10 border-b border-[rgb(129,195,215,0.25)] bg-[#102637]/85 px-4 py-3 text-left text-sm font-medium text-white">
-                              {row}
-                            </th>
-                            {heatmap.variables.map((_, j) => {
-                              const value = heatmap.matrix[i][j];
-                              const min = heatmap.scale.min;
-                              const max = heatmap.scale.max;
-                              const t = (value - min) / ((max - min) || 1);
-                              const background =
-                                i === j ? "rgba(15,23,42,0.4)" : `hsl(${Math.round(210 - 210 * t)} 80% ${20 + 30 * t}%)`;
-                              return (
-                                <td
-                                  key={j}
-                                  className="border-b border-[rgb(129,195,215,0.25)] px-3 py-2 text-center text-sm font-medium text-slate-100"
-                                  style={{ background }}
-                                >
-                                  {value}
-                                </td>
-                              );
-                            })}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                {heatmap && !heatmapError && renderHeatmapContent()}
               </div>
 
               <div className="space-y-4 surface-muted p-5">
@@ -1286,6 +1767,22 @@ export default function Page() {
                       />
                       Dirigido
                     </label>
+                    <Button
+                      variant="secondary"
+                      className="border-[rgb(var(--accent-rgb)_/_0.35)] px-3"
+                      disabled={!graph || !!graphError || graphLoading}
+                      onClick={() => {
+                        if (!graph) return;
+                        openChartPreview(
+                          "Red de influencias",
+                          <div className="h-[520px] md:h-[560px]">
+                            <InfluencesGraph graph={graph} />
+                          </div>
+                        );
+                      }}
+                    >
+                      Ver en popup
+                    </Button>
                   </div>
                 </div>
 
@@ -1322,6 +1819,11 @@ export default function Page() {
           </section>
         )}
       </div>
+      {chartModal && (
+        <ChartModal open={!!chartModal} title={chartModal.title} onClose={() => setChartModal(null)}>
+          {chartModal.content}
+        </ChartModal>
+      )}
       <ScaleManagerModal
         open={showScaleModal && !!editingScale}
         onClose={() => setShowScaleModal(false)}
@@ -1337,7 +1839,3 @@ export default function Page() {
 }
 
 // GraphCanvas moved to components/organisms/InfluencesGraph
-
-
-
-
